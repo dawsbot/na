@@ -26,6 +26,10 @@ struct Args {
     /// Show timing information
     #[arg(long)]
     timing: bool,
+
+    /// Disable streaming output (collect all before displaying)
+    #[arg(long)]
+    no_stream: bool,
 }
 
 // ============================================================================
@@ -161,11 +165,8 @@ async fn main() -> Result<()> {
     let advisories = query_npm_bulk_api(&bulk_request).await?;
     let api_time = api_start.elapsed();
 
-    // Match advisories to packages (direct vulnerabilities)
-    let direct_vulns = match_advisories_to_packages(&packages, &advisories);
-
-    // Find meta-vulnerabilities using declared dependencies (npm-style)
-    let all_vulns = find_meta_vulnerabilities_npm_style(&lockfile, &direct_vulns);
+    // Determine streaming mode (stream for text output, unless disabled)
+    let stream = args.format != "json" && !args.no_stream;
 
     // Filter by severity if requested
     let severity_order = ["info", "low", "moderate", "high", "critical"];
@@ -174,22 +175,36 @@ async fn main() -> Result<()> {
         .and_then(|s| severity_order.iter().position(|&x| x == s.to_lowercase()))
         .unwrap_or(0);
 
-    let filtered: Vec<_> = all_vulns
-        .into_iter()
-        .filter(|r| {
-            let idx = severity_order.iter().position(|&x| x == r.severity.to_lowercase()).unwrap_or(0);
-            idx >= min_index
-        })
-        .collect();
+    let severity_filter = |r: &VulnerabilityReport| -> bool {
+        let idx = severity_order.iter().position(|&x| x == r.severity.to_lowercase()).unwrap_or(0);
+        idx >= min_index
+    };
 
-    // Display results
+    // Match advisories to packages (direct vulnerabilities) - streams if enabled
     let display_start = Instant::now();
+    let direct_vulns = match_advisories_to_packages(&packages, &advisories, stream, &severity_filter);
+
+    // Find meta-vulnerabilities using declared dependencies (npm-style) - streams if enabled
+    let all_vulns = find_meta_vulnerabilities_npm_style(&lockfile, &direct_vulns, stream, &severity_filter);
+
+    // For JSON or no-stream mode, filter and display at the end
+    let filtered: Vec<_> = if stream {
+        all_vulns // Already filtered during streaming
+    } else {
+        all_vulns.into_iter().filter(|r| severity_filter(r)).collect()
+    };
+
+    // Display results (summary for streaming, full output for batch)
     match args.format.as_str() {
         "json" => {
             println!("{}", serde_json::to_string_pretty(&filtered)?);
         }
         _ => {
-            display_results(&filtered)?;
+            if stream {
+                display_summary(&filtered)?;
+            } else {
+                display_results(&filtered)?;
+            }
         }
     }
     let display_time = display_start.elapsed();
@@ -437,10 +452,15 @@ async fn query_npm_bulk_api(request: &BulkAuditRequest) -> Result<HashMap<String
     Ok(advisories)
 }
 
-fn match_advisories_to_packages(
+fn match_advisories_to_packages<F>(
     packages: &[PackageInfo],
     advisories: &HashMap<String, Vec<BulkAdvisory>>,
-) -> Vec<VulnerabilityReport> {
+    stream: bool,
+    severity_filter: F,
+) -> Vec<VulnerabilityReport>
+where
+    F: Fn(&VulnerabilityReport) -> bool,
+{
     let mut reports = Vec::new();
 
     for (pkg_name, pkg_advisories) in advisories {
@@ -450,7 +470,7 @@ fn match_advisories_to_packages(
             // Filter out workspace root packages (paths without node_modules)
             for pkg in packages.iter().filter(|p| &p.name == pkg_name && p.path.contains("node_modules")) {
                 if version_matches_range(&pkg.version, vulnerable_range) {
-                    reports.push(VulnerabilityReport {
+                    let report = VulnerabilityReport {
                         package: pkg.name.clone(),
                         version: pkg.version.clone(),
                         id: advisory.id,
@@ -464,7 +484,12 @@ fn match_advisories_to_packages(
                         github_advisory_id: advisory.github_advisory_id.clone(),
                         via: None,
                         dependency_chain: vec![],
-                    });
+                    };
+
+                    if stream && severity_filter(&report) {
+                        print_report(&report);
+                    }
+                    reports.push(report);
                 }
             }
         }
@@ -475,10 +500,15 @@ fn match_advisories_to_packages(
 
 /// NPM-style meta-vulnerability detection using declared dependencies
 /// Only finds packages that DIRECTLY depend on a directly vulnerable package (1 level)
-fn find_meta_vulnerabilities_npm_style(
+fn find_meta_vulnerabilities_npm_style<F>(
     lockfile: &PackageLock,
     direct_vulns: &[VulnerabilityReport],
-) -> Vec<VulnerabilityReport> {
+    stream: bool,
+    severity_filter: F,
+) -> Vec<VulnerabilityReport>
+where
+    F: Fn(&VulnerabilityReport) -> bool,
+{
     let mut all_vulns = direct_vulns.to_vec();
 
     // Build set of directly vulnerable package names (not transitive)
@@ -517,7 +547,7 @@ fn find_meta_vulnerabilities_npm_style(
                     .map(|v| (v.severity.clone(), v.id, v.title.clone(), v.url.clone(), v.cwe.clone(), v.cvss_score))
                     .unwrap_or_else(|| ("unknown".to_string(), 0, "Unknown".to_string(), None, vec![], None));
 
-                all_vulns.push(VulnerabilityReport {
+                let report = VulnerabilityReport {
                     package: pkg_name.clone(),
                     version: entry.version.clone().unwrap_or_default(),
                     id,
@@ -531,12 +561,18 @@ fn find_meta_vulnerabilities_npm_style(
                     github_advisory_id: None,
                     via: Some(via_dep.clone()),
                     dependency_chain: vec![],
-                });
+                };
+
+                if stream && severity_filter(&report) {
+                    print_report(&report);
+                }
+                all_vulns.push(report);
             }
         }
     }
 
     // Sort by severity (critical first), then by whether it's direct or meta
+    // Note: when streaming, output order is discovery order; this sorts for the final collection
     let severity_order = ["critical", "high", "moderate", "low", "info"];
     all_vulns.sort_by(|a, b| {
         let a_idx = severity_order.iter().position(|&x| x == a.severity.to_lowercase()).unwrap_or(5);
@@ -764,16 +800,10 @@ fn compare_versions(a: &[u64], b: &[u64]) -> i32 {
     0
 }
 
-fn display_results(reports: &[VulnerabilityReport]) -> Result<()> {
-    if reports.is_empty() {
-        println!("{}", "found 0 vulnerabilities".green().bold());
-        return Ok(());
-    }
-
-    // NPM-style deduplication: count unique package names
-    // For each package, track highest severity and whether it has a direct vulnerability
+/// Compute vulnerability statistics for summary display
+fn compute_vuln_stats(reports: &[VulnerabilityReport]) -> (usize, usize, usize, HashMap<&'static str, usize>) {
     let severity_order = ["info", "low", "moderate", "high", "critical"];
-    let mut package_info: HashMap<&str, (usize, bool)> = HashMap::new(); // (max_severity_idx, is_direct)
+    let mut package_info: HashMap<&str, (usize, bool)> = HashMap::new();
 
     for r in reports {
         let sev_idx = severity_order.iter().position(|&s| s == r.severity.to_lowercase()).unwrap_or(0);
@@ -793,24 +823,61 @@ fn display_results(reports: &[VulnerabilityReport]) -> Result<()> {
     }
 
     let total_packages = package_info.len();
+    let direct_pkg_count = package_info.values().filter(|(_, is_direct)| *is_direct).count();
+    let transitive_pkg_count = total_packages - direct_pkg_count;
 
-    // Count by severity (using highest severity per package)
-    let mut severity_counts: HashMap<&str, usize> = HashMap::new();
+    let mut severity_counts: HashMap<&'static str, usize> = HashMap::new();
     for (_, (sev_idx, _)) in &package_info {
         let sev = severity_order[*sev_idx];
         *severity_counts.entry(sev).or_insert(0) += 1;
     }
 
-    // Count direct vs transitive packages
-    let direct_pkg_count = package_info.values().filter(|(_, is_direct)| *is_direct).count();
-    let transitive_pkg_count = total_packages - direct_pkg_count;
+    (total_packages, direct_pkg_count, transitive_pkg_count, severity_counts)
+}
+
+/// Display summary only (for streaming mode where vulns were already printed)
+fn display_summary(reports: &[VulnerabilityReport]) -> Result<()> {
+    if reports.is_empty() {
+        println!("{}", "found 0 vulnerabilities".green().bold());
+        return Ok(());
+    }
+
+    let (total, direct, transitive, severity_counts) = compute_vuln_stats(reports);
+
+    // Summary line
+    let mut summary_parts = Vec::new();
+    for sev in ["critical", "high", "moderate", "low", "info"] {
+        if let Some(&count) = severity_counts.get(sev) {
+            summary_parts.push(format!("{} {}", count, sev));
+        }
+    }
+
+    println!(
+        "\nfound {} {} ({} direct, {} transitive): {}",
+        total.to_string().bold(),
+        if total == 1 { "vulnerability" } else { "vulnerabilities" },
+        direct,
+        transitive,
+        summary_parts.join(", ")
+    );
+
+    Ok(())
+}
+
+fn display_results(reports: &[VulnerabilityReport]) -> Result<()> {
+    if reports.is_empty() {
+        println!("{}", "found 0 vulnerabilities".green().bold());
+        return Ok(());
+    }
+
+    let (total, direct, transitive, severity_counts) = compute_vuln_stats(reports);
 
     println!(
         "found {} {} ({} direct, {} transitive):\n",
-        total_packages.to_string().bold(),
-        if total_packages == 1 { "vulnerability" } else { "vulnerabilities" },
-        direct_pkg_count,
-        transitive_pkg_count
+        total.to_string().bold(),
+        if total == 1 { "vulnerability" } else { "vulnerabilities" },
+        direct,
+        transitive
     );
 
     for report in reports {
@@ -828,7 +895,7 @@ fn display_results(reports: &[VulnerabilityReport]) -> Result<()> {
     println!(
         "\n{} ({} in total)",
         summary_parts.join(", "),
-        total_packages
+        total
     );
 
     Ok(())

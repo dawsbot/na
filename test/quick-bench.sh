@@ -38,6 +38,8 @@ echo "$NA_OUTPUT" | tail -1
 echo ""
 
 echo "=== npm audit ==="
+# Clear npm cache to ensure cold run (no cached audit results)
+rm -rf ~/.npm/_cacache 2>/dev/null
 NPM_RESULT=$(measure_ms npm audit)
 NPM_TIME=$(echo "$NPM_RESULT" | head -1)
 NPM_OUTPUT=$(echo "$NPM_RESULT" | tail -n +2)

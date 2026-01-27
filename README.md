@@ -4,7 +4,7 @@
 
 # na
 
-Run npm audit. <!-- FASTEST_SPEEDUP_START -->49.6<!-- FASTEST_SPEEDUP_END -->x faster.
+Run npm audit. <!-- FASTEST_SPEEDUP_START -->72.6<!-- FASTEST_SPEEDUP_END -->x faster.
 
 A zero-overhead npm audit tool written in Rust. No Node.js startup, no npm overhead—just your vulnerabilities.
 
@@ -13,8 +13,8 @@ A zero-overhead npm audit tool written in Rust. No Node.js startup, no npm overh
 <!-- BENCHMARK_START -->
 | Tool | Time | Vulnerabilities |
 |------|------|-----------------|
-| na | 814ms | 698 (total) |
-| npm audit | 40.3s | 428 (deduplicated) |
+| na | 630ms | 698 (total) |
+| npm audit | 45.7s | 428 (deduplicated) |
 
 *Measured on macOS (Apple Silicon). Your mileage may vary.*
 <!-- BENCHMARK_END -->

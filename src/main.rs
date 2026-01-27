@@ -164,8 +164,8 @@ async fn main() -> Result<()> {
     // Match advisories to packages (direct vulnerabilities)
     let direct_vulns = match_advisories_to_packages(&packages, &advisories);
 
-    // Find meta-vulnerabilities (packages that depend on vulnerable packages)
-    let all_vulns = find_meta_vulnerabilities(&packages, &direct_vulns, &reverse_graph);
+    // Find meta-vulnerabilities using declared dependencies (npm-style)
+    let all_vulns = find_meta_vulnerabilities_npm_style(&lockfile, &direct_vulns);
 
     // Filter by severity if requested
     let severity_order = ["info", "low", "moderate", "high", "critical"];
@@ -473,6 +473,100 @@ fn match_advisories_to_packages(
     reports
 }
 
+/// NPM-style meta-vulnerability detection using declared dependencies
+/// Only finds packages that DIRECTLY depend on a directly vulnerable package (1 level)
+fn find_meta_vulnerabilities_npm_style(
+    lockfile: &PackageLock,
+    direct_vulns: &[VulnerabilityReport],
+) -> Vec<VulnerabilityReport> {
+    let mut all_vulns = direct_vulns.to_vec();
+
+    // Build set of directly vulnerable package names (not transitive)
+    let direct_vuln_names: HashSet<String> = direct_vulns.iter()
+        .map(|v| v.package.clone())
+        .collect();
+
+    // Track seen package names for deduplication
+    let mut seen_names: HashSet<String> = direct_vuln_names.clone();
+
+    // Single pass: find packages that depend on directly vulnerable packages
+    if let Some(pkgs) = &lockfile.packages {
+        for (path, entry) in pkgs {
+            // Skip root package
+            if path.is_empty() {
+                continue;
+            }
+
+            let pkg_name = extract_package_name(path);
+
+            // Skip if already seen (e.g., directly vulnerable)
+            if seen_names.contains(&pkg_name) {
+                continue;
+            }
+
+            // Check if any declared dependency is DIRECTLY vulnerable
+            let all_deps = collect_all_dep_names(entry);
+            let vulnerable_dep = all_deps.iter().find(|dep| direct_vuln_names.contains(*dep));
+
+            if let Some(via_dep) = vulnerable_dep {
+                seen_names.insert(pkg_name.clone());
+
+                // Get info from the direct vulnerability this depends on
+                let (severity, id, title, url, cwe, cvss) = direct_vulns.iter()
+                    .find(|v| &v.package == via_dep)
+                    .map(|v| (v.severity.clone(), v.id, v.title.clone(), v.url.clone(), v.cwe.clone(), v.cvss_score))
+                    .unwrap_or_else(|| ("unknown".to_string(), 0, "Unknown".to_string(), None, vec![], None));
+
+                all_vulns.push(VulnerabilityReport {
+                    package: pkg_name.clone(),
+                    version: entry.version.clone().unwrap_or_default(),
+                    id,
+                    title,
+                    severity,
+                    cvss_score: cvss,
+                    vulnerable_versions: None,
+                    recommendation: None,
+                    url,
+                    cwe,
+                    github_advisory_id: None,
+                    via: Some(via_dep.clone()),
+                    dependency_chain: vec![],
+                });
+            }
+        }
+    }
+
+    // Sort by severity (critical first), then by whether it's direct or meta
+    let severity_order = ["critical", "high", "moderate", "low", "info"];
+    all_vulns.sort_by(|a, b| {
+        let a_idx = severity_order.iter().position(|&x| x == a.severity.to_lowercase()).unwrap_or(5);
+        let b_idx = severity_order.iter().position(|&x| x == b.severity.to_lowercase()).unwrap_or(5);
+        match a_idx.cmp(&b_idx) {
+            std::cmp::Ordering::Equal => {
+                a.via.is_some().cmp(&b.via.is_some())
+            }
+            other => other,
+        }
+    });
+
+    all_vulns
+}
+
+/// Collect production dependency names from a package entry (exclude devDependencies)
+fn collect_all_dep_names(entry: &PackageEntry) -> Vec<String> {
+    let mut deps = Vec::new();
+    if let Some(d) = &entry.dependencies {
+        deps.extend(d.keys().cloned());
+    }
+    // Include peer dependencies as they affect runtime
+    if let Some(d) = &entry.peer_dependencies {
+        deps.extend(d.keys().cloned());
+    }
+    // Skip optional and dev dependencies for npm-style counting
+    deps
+}
+
+#[allow(dead_code)]
 fn find_meta_vulnerabilities(
     packages: &[PackageInfo],
     direct_vulns: &[VulnerabilityReport],
@@ -493,78 +587,64 @@ fn find_meta_vulnerabilities(
         .map(|p| (p.path.clone(), p))
         .collect();
 
-    // For each direct vulnerability, find all packages that depend on it
-    let mut seen_meta: HashSet<(String, String, u64)> = HashSet::new(); // (pkg_name, version, advisory_id)
-
-    // Mark direct vulns as seen
+    // Track vulnerable package names (for npm-style propagation)
+    let mut vulnerable_pkg_names: HashSet<String> = HashSet::new();
     for v in direct_vulns {
-        seen_meta.insert((v.package.clone(), v.version.clone(), v.id));
+        vulnerable_pkg_names.insert(v.package.clone());
     }
 
-    for vuln in direct_vulns {
-        // Find all paths for this vulnerable package
-        if let Some(vuln_paths) = name_to_paths.get(&vuln.package) {
-            for vuln_path in vuln_paths {
-                // Check if this path has the vulnerable version
-                if let Some(pkg) = path_to_pkg.get(vuln_path) {
-                    if pkg.version != vuln.version {
-                        continue;
-                    }
+    // Track all vulnerable paths (direct vulnerabilities)
+    let mut vulnerable_paths: HashSet<String> = HashSet::new();
+    for v in direct_vulns {
+        for (path, pkg) in &path_to_pkg {
+            if pkg.name == v.package && pkg.version == v.version {
+                vulnerable_paths.insert(path.clone());
+            }
+        }
+    }
+
+    // NPM-style: find packages that directly depend on vulnerable packages
+    // Only 1 level of indirection from direct vulnerabilities
+    let mut seen_meta: HashSet<String> = vulnerable_pkg_names.clone();
+
+    for vuln_path in &vulnerable_paths.clone() {
+        if let Some(dependents) = reverse_graph.get(vuln_path) {
+            for dep_path in dependents {
+                if dep_path.is_empty() {
+                    continue;
                 }
 
-                // BFS to find all dependents
-                let mut queue: VecDeque<(String, Vec<String>)> = VecDeque::new();
-                let mut visited: HashSet<String> = HashSet::new();
+                if let Some(pkg) = path_to_pkg.get(dep_path) {
+                    // Only add if we haven't seen this package name
+                    if seen_meta.insert(pkg.name.clone()) {
+                        // Find the vulnerable package this depends on
+                        let via_pkg = path_to_pkg.get(vuln_path).map(|p| p.name.clone());
 
-                // Start with packages that directly depend on the vulnerable package
-                if let Some(dependents) = reverse_graph.get(vuln_path) {
-                    for dep in dependents {
-                        if dep.is_empty() {
-                            continue; // Skip root
-                        }
-                        queue.push_back((dep.clone(), vec![vuln.package.clone()]));
-                    }
-                }
+                        // Get severity from the via package
+                        let (severity, id, title, url, cwe, cvss) = if let Some(via_name) = &via_pkg {
+                            all_vulns.iter()
+                                .find(|v| &v.package == via_name)
+                                .map(|v| (v.severity.clone(), v.id, v.title.clone(), v.url.clone(), v.cwe.clone(), v.cvss_score))
+                                .unwrap_or_else(|| ("unknown".to_string(), 0, "Unknown".to_string(), None, vec![], None))
+                        } else {
+                            ("unknown".to_string(), 0, "Unknown".to_string(), None, vec![], None)
+                        };
 
-                while let Some((path, chain)) = queue.pop_front() {
-                    if visited.contains(&path) {
-                        continue;
-                    }
-                    visited.insert(path.clone());
-
-                    if let Some(pkg) = path_to_pkg.get(&path) {
-                        let key = (pkg.name.clone(), pkg.version.clone(), vuln.id);
-                        if seen_meta.insert(key) {
-                            let mut new_chain = chain.clone();
-                            new_chain.insert(0, pkg.name.clone());
-
-                            all_vulns.push(VulnerabilityReport {
-                                package: pkg.name.clone(),
-                                version: pkg.version.clone(),
-                                id: vuln.id,
-                                title: vuln.title.clone(),
-                                severity: vuln.severity.clone(),
-                                cvss_score: vuln.cvss_score,
-                                vulnerable_versions: None, // Not directly vulnerable
-                                recommendation: None,
-                                url: vuln.url.clone(),
-                                cwe: vuln.cwe.clone(),
-                                github_advisory_id: vuln.github_advisory_id.clone(),
-                                via: Some(vuln.package.clone()),
-                                dependency_chain: new_chain,
-                            });
-                        }
-
-                        // Continue BFS to find transitive dependents
-                        if let Some(next_dependents) = reverse_graph.get(&path) {
-                            for next in next_dependents {
-                                if !next.is_empty() && !visited.contains(next) {
-                                    let mut new_chain = chain.clone();
-                                    new_chain.insert(0, pkg.name.clone());
-                                    queue.push_back((next.clone(), new_chain));
-                                }
-                            }
-                        }
+                        all_vulns.push(VulnerabilityReport {
+                            package: pkg.name.clone(),
+                            version: pkg.version.clone(),
+                            id,
+                            title,
+                            severity,
+                            cvss_score: cvss,
+                            vulnerable_versions: None,
+                            recommendation: None,
+                            url,
+                            cwe,
+                            github_advisory_id: None,
+                            via: via_pkg,
+                            dependency_chain: vec![],
+                        });
                     }
                 }
             }
@@ -690,22 +770,47 @@ fn display_results(reports: &[VulnerabilityReport]) -> Result<()> {
         return Ok(());
     }
 
-    // Count by severity
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    // NPM-style deduplication: count unique package names
+    // For each package, track highest severity and whether it has a direct vulnerability
+    let severity_order = ["info", "low", "moderate", "high", "critical"];
+    let mut package_info: HashMap<&str, (usize, bool)> = HashMap::new(); // (max_severity_idx, is_direct)
+
     for r in reports {
-        *counts.entry(r.severity.as_str()).or_insert(0) += 1;
+        let sev_idx = severity_order.iter().position(|&s| s == r.severity.to_lowercase()).unwrap_or(0);
+        let is_direct = r.via.is_none();
+
+        package_info
+            .entry(&r.package)
+            .and_modify(|(max_sev, has_direct)| {
+                if sev_idx > *max_sev {
+                    *max_sev = sev_idx;
+                }
+                if is_direct {
+                    *has_direct = true;
+                }
+            })
+            .or_insert((sev_idx, is_direct));
     }
 
-    // Count direct vs transitive
-    let direct_count = reports.iter().filter(|r| r.via.is_none()).count();
-    let transitive_count = reports.len() - direct_count;
+    let total_packages = package_info.len();
+
+    // Count by severity (using highest severity per package)
+    let mut severity_counts: HashMap<&str, usize> = HashMap::new();
+    for (_, (sev_idx, _)) in &package_info {
+        let sev = severity_order[*sev_idx];
+        *severity_counts.entry(sev).or_insert(0) += 1;
+    }
+
+    // Count direct vs transitive packages
+    let direct_pkg_count = package_info.values().filter(|(_, is_direct)| *is_direct).count();
+    let transitive_pkg_count = total_packages - direct_pkg_count;
 
     println!(
         "found {} {} ({} direct, {} transitive):\n",
-        reports.len().to_string().bold(),
-        if reports.len() == 1 { "vulnerability" } else { "vulnerabilities" },
-        direct_count,
-        transitive_count
+        total_packages.to_string().bold(),
+        if total_packages == 1 { "vulnerability" } else { "vulnerabilities" },
+        direct_pkg_count,
+        transitive_pkg_count
     );
 
     for report in reports {
@@ -715,7 +820,7 @@ fn display_results(reports: &[VulnerabilityReport]) -> Result<()> {
     // Summary line
     let mut summary_parts = Vec::new();
     for sev in ["critical", "high", "moderate", "low", "info"] {
-        if let Some(&count) = counts.get(sev) {
+        if let Some(&count) = severity_counts.get(sev) {
             summary_parts.push(format!("{} {}", count, sev));
         }
     }
@@ -723,7 +828,7 @@ fn display_results(reports: &[VulnerabilityReport]) -> Result<()> {
     println!(
         "\n{} ({} in total)",
         summary_parts.join(", "),
-        reports.len()
+        total_packages
     );
 
     Ok(())

@@ -1,938 +1,388 @@
-use anyhow::{Context, Result};
+//! `na` — `npm audit` output, byte for byte, without starting Node.
+//!
+//! The pipeline mirrors npm's: load the lockfile into an arborist-style tree,
+//! POST the bulk advisory request, compute metavulns against registry
+//! packuments with the same algorithm as `@npmcli/metavuln-calculator`, work
+//! out `fixAvailable` with `npm-pick-manifest`'s rules, and print through a
+//! port of `npm-audit-report`. The speed comes from skipping Node startup and
+//! fetching every packument concurrently over HTTP/2.
+
+mod advisory;
+mod audit;
+mod collate;
+mod config;
+mod npa;
+mod pick;
+mod registry;
+mod report;
+mod semver;
+mod tree;
+
 use clap::Parser;
-use colored::*;
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(name = "na", about = "Fast npm audit replacement", version)]
+#[command(
+    name = "na",
+    version,
+    about = "npm audit, identical output, without Node.js",
+    disable_help_subcommand = true
+)]
 struct Args {
-    /// Path to package-lock.json
-    #[arg(short, long, default_value = "package-lock.json")]
-    lockfile: PathBuf,
+    /// `npm audit fix` / `npm audit signatures` are not supported.
+    #[arg(hide = true)]
+    subcommand: Vec<String>,
 
-    /// Output format: text, json
-    #[arg(short, long, default_value = "text")]
-    format: String,
+    /// Output the audit report as JSON (`npm audit --json`)
+    #[arg(long)]
+    json: bool,
 
-    /// Only show vulnerabilities of this severity or higher
-    #[arg(short, long)]
-    severity: Option<String>,
+    /// Minimum severity that causes a non-zero exit code
+    #[arg(long = "audit-level", value_name = "LEVEL")]
+    audit_level: Option<String>,
 
-    /// Show timing information
+    /// Dependency types to omit (dev, optional, peer); repeatable
+    #[arg(long, value_delimiter = ',', value_name = "TYPE")]
+    omit: Vec<String>,
+
+    /// Dependency types to include even if omitted; repeatable
+    #[arg(long, value_delimiter = ',', value_name = "TYPE")]
+    include: Vec<String>,
+
+    /// Same as --omit=dev
+    #[arg(long, visible_alias = "prod")]
+    production: bool,
+
+    /// `--only=prod` is the same as --omit=dev
+    #[arg(long, value_name = "TYPE")]
+    only: Option<String>,
+
+    /// Registry to use (default from .npmrc or https://registry.npmjs.org)
+    #[arg(long, value_name = "URL")]
+    registry: Option<String>,
+
+    /// Project directory (default: nearest ancestor with a package.json)
+    #[arg(long, value_name = "DIR")]
+    prefix: Option<PathBuf>,
+
+    /// Force color on (`--color`, `--color=always`) or off (`--color=false`)
+    #[arg(long, num_args = 0..=1, default_missing_value = "always", require_equals = true, value_name = "WHEN")]
+    color: Option<String>,
+
+    /// Disable color
+    #[arg(long = "no-color")]
+    no_color: bool,
+
+    /// Accepted for npm compatibility (na never reads node_modules)
+    #[arg(long = "package-lock-only", hide = true)]
+    package_lock_only: bool,
+
+    /// Directory for the packument cache (default: ~/.cache/na)
+    #[arg(long = "cache-dir", value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Do not read or write the packument cache
+    #[arg(long = "no-cache")]
+    no_cache: bool,
+
+    /// Revalidate cached packuments with the registry even when fresh
+    #[arg(long = "prefer-online")]
+    prefer_online: bool,
+
+    /// Print phase timings to stderr
     #[arg(long)]
     timing: bool,
 
-    /// Disable streaming output (collect all before displaying)
-    #[arg(long)]
-    no_stream: bool,
+    /// Maximum concurrent registry requests
+    #[arg(long, default_value_t = 64, value_name = "N")]
+    concurrency: usize,
+
+    /// Node version used for `engines` checks (default: `node --version`)
+    #[arg(long = "node-version", value_name = "VERSION")]
+    node_version: Option<String>,
+
+    /// npm version used for `engines` checks (default: the installed npm)
+    #[arg(long = "npm-version", value_name = "VERSION")]
+    npm_version: Option<String>,
 }
 
-// ============================================================================
-// Package-lock.json structures
-// ============================================================================
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PackageLock {
-    packages: Option<IndexMap<String, PackageEntry>>,
-    dependencies: Option<IndexMap<String, LegacyDependency>>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct PackageEntry {
-    version: Option<String>,
-    resolved: Option<String>,
-    dependencies: Option<IndexMap<String, String>>,
-    dev_dependencies: Option<IndexMap<String, String>>,
-    peer_dependencies: Option<IndexMap<String, String>>,
-    optional_dependencies: Option<IndexMap<String, String>>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct LegacyDependency {
-    version: String,
-    dependencies: Option<IndexMap<String, LegacyDependency>>,
-    requires: Option<IndexMap<String, String>>,
-}
-
-// ============================================================================
-// npm Bulk Advisory API structures
-// ============================================================================
-
-type BulkAuditRequest = HashMap<String, Vec<String>>;
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct BulkAdvisory {
-    id: u64,
-    title: String,
-    #[serde(default)]
-    severity: String,
-    url: Option<String>,
-    vulnerable_versions: Option<String>,
-    module_name: Option<String>,
-    #[serde(default)]
-    cwe: Vec<String>,
-    #[serde(default)]
-    cvss: Option<CvssInfo>,
-    overview: Option<String>,
-    recommendation: Option<String>,
-    references: Option<String>,
-    github_advisory_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct CvssInfo {
-    score: Option<f64>,
-    #[serde(rename = "vectorString")]
-    vector_string: Option<String>,
-}
-
-// ============================================================================
-// Internal structures
-// ============================================================================
-
-#[derive(Debug, Clone)]
-struct PackageInfo {
-    name: String,
-    version: String,
-    path: String,
-}
-
-/// Dependency graph: maps package path -> list of dependency paths
-type DependencyGraph = HashMap<String, Vec<String>>;
-
-/// Reverse dependency graph: maps package path -> list of dependents (who depends on this)
-type ReverseDependencyGraph = HashMap<String, Vec<String>>;
-
-#[derive(Debug, Serialize, Clone)]
-struct VulnerabilityReport {
-    package: String,
-    version: String,
-    id: u64,
-    title: String,
-    severity: String,
-    cvss_score: Option<f64>,
-    vulnerable_versions: Option<String>,
-    recommendation: Option<String>,
-    url: Option<String>,
-    cwe: Vec<String>,
-    github_advisory_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    via: Option<String>, // For meta-vulnerabilities: which direct vuln this comes from
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    dependency_chain: Vec<String>, // Path from this package to the vulnerable dep
-}
-
-// ============================================================================
-// Main logic
-// ============================================================================
-
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() {
     let args = Args::parse();
-    let total_start = Instant::now();
-
-    // Parse lockfile
-    let parse_start = Instant::now();
-    let lockfile_content = fs::read_to_string(&args.lockfile)
-        .with_context(|| format!("Failed to read {}", args.lockfile.display()))?;
-    let lockfile: PackageLock = serde_json::from_str(&lockfile_content)
-        .with_context(|| "Failed to parse package-lock.json")?;
-    let parse_time = parse_start.elapsed();
-
-    // Extract packages and build dependency graph
-    let build_start = Instant::now();
-    let (packages, dep_graph, reverse_graph) = extract_packages_and_graph(&lockfile);
-    let dep_count = packages.len();
-
-    // Build bulk request
-    let bulk_request = build_bulk_request(&packages);
-    let build_time = build_start.elapsed();
-
-    if bulk_request.is_empty() {
-        println!("{}", "No packages found in lockfile".yellow());
-        return Ok(());
-    }
-
-    // Query npm bulk advisory API
-    let api_start = Instant::now();
-    let advisories = query_npm_bulk_api(&bulk_request).await?;
-    let api_time = api_start.elapsed();
-
-    // Determine streaming mode (stream for text output, unless disabled)
-    let stream = args.format != "json" && !args.no_stream;
-
-    // Filter by severity if requested
-    let severity_order = ["info", "low", "moderate", "high", "critical"];
-    let min_index = args.severity
-        .as_ref()
-        .and_then(|s| severity_order.iter().position(|&x| x == s.to_lowercase()))
-        .unwrap_or(0);
-
-    let severity_filter = |r: &VulnerabilityReport| -> bool {
-        let idx = severity_order.iter().position(|&x| x == r.severity.to_lowercase()).unwrap_or(0);
-        idx >= min_index
-    };
-
-    // Match advisories to packages (direct vulnerabilities) - streams if enabled
-    let display_start = Instant::now();
-    let direct_vulns = match_advisories_to_packages(&packages, &advisories, stream, &severity_filter);
-
-    // Find meta-vulnerabilities using declared dependencies (npm-style) - streams if enabled
-    let all_vulns = find_meta_vulnerabilities_npm_style(&lockfile, &direct_vulns, stream, &severity_filter);
-
-    // For JSON or no-stream mode, filter and display at the end
-    let filtered: Vec<_> = if stream {
-        all_vulns // Already filtered during streaming
-    } else {
-        all_vulns.into_iter().filter(|r| severity_filter(r)).collect()
-    };
-
-    // Display results (summary for streaming, full output for batch)
-    match args.format.as_str() {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&filtered)?);
-        }
-        _ => {
-            if stream {
-                display_summary(&filtered)?;
-            } else {
-                display_results(&filtered)?;
-            }
-        }
-    }
-    let display_time = display_start.elapsed();
-
-    if args.timing {
-        eprintln!("\n{}", "Timing:".dimmed());
-        eprintln!("  Parse lockfile:  {:>8.2?}", parse_time);
-        eprintln!("  Build request:   {:>8.2?}", build_time);
-        eprintln!("  API call:        {:>8.2?}", api_time);
-        eprintln!("  Display:         {:>8.2?}", display_time);
-        eprintln!("  {}: {:>8.2?}", "Total".bold(), total_start.elapsed());
-        eprintln!("  Dependencies scanned: {}", dep_count);
-    }
-
-    if !filtered.is_empty() {
-        std::process::exit(1);
-    }
-
-    Ok(())
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let code = rt.block_on(async_main(args));
+    // Let stdout flush, then exit with npm's exit code.
+    std::process::exit(code);
 }
 
-fn extract_packages_and_graph(lockfile: &PackageLock) -> (Vec<PackageInfo>, DependencyGraph, ReverseDependencyGraph) {
-    let mut packages = Vec::new();
-    let mut seen = HashSet::new();
-    let mut dep_graph: DependencyGraph = HashMap::new();
-    let mut reverse_graph: ReverseDependencyGraph = HashMap::new();
-
-    // Handle lockfileVersion 2/3 (packages field)
-    if let Some(pkgs) = &lockfile.packages {
-        for (path, entry) in pkgs {
-            if path.is_empty() {
-                // Root package - still process its dependencies
-                if let Some(deps) = &entry.dependencies {
-                    for dep_name in deps.keys() {
-                        let dep_path = format!("node_modules/{}", dep_name);
-                        dep_graph.entry("".to_string()).or_default().push(dep_path.clone());
-                        reverse_graph.entry(dep_path).or_default().push("".to_string());
-                    }
-                }
-                continue;
-            }
-
-            let name = extract_package_name(path);
-
-            // Skip file: and link: dependencies
-            if let Some(resolved) = &entry.resolved {
-                if resolved.starts_with("file:") || resolved.starts_with("link:") {
-                    continue;
-                }
-            }
-
-            if let Some(version) = &entry.version {
-                let key = (name.clone(), version.clone());
-                if seen.insert(key) {
-                    packages.push(PackageInfo {
-                        name: name.clone(),
-                        version: version.clone(),
-                        path: path.clone(),
-                    });
-                }
-
-                // Build dependency edges
-                let all_deps = collect_all_deps(entry);
-                for dep_name in all_deps {
-                    // Find the resolved path for this dependency
-                    let dep_path = resolve_dependency_path(path, &dep_name, pkgs);
-                    if let Some(dp) = dep_path {
-                        dep_graph.entry(path.clone()).or_default().push(dp.clone());
-                        reverse_graph.entry(dp).or_default().push(path.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    // Handle lockfileVersion 1 (dependencies field)
-    if let Some(deps) = &lockfile.dependencies {
-        collect_legacy_packages_and_graph(
-            deps,
-            "",
-            &mut packages,
-            &mut seen,
-            &mut dep_graph,
-            &mut reverse_graph,
-        );
-    }
-
-    (packages, dep_graph, reverse_graph)
-}
-
-fn collect_all_deps(entry: &PackageEntry) -> Vec<String> {
-    let mut deps = Vec::new();
-    if let Some(d) = &entry.dependencies {
-        deps.extend(d.keys().cloned());
-    }
-    if let Some(d) = &entry.dev_dependencies {
-        deps.extend(d.keys().cloned());
-    }
-    if let Some(d) = &entry.peer_dependencies {
-        deps.extend(d.keys().cloned());
-    }
-    if let Some(d) = &entry.optional_dependencies {
-        deps.extend(d.keys().cloned());
-    }
-    deps
-}
-
-fn resolve_dependency_path(from_path: &str, dep_name: &str, packages: &IndexMap<String, PackageEntry>) -> Option<String> {
-    // Try to find the dependency by walking up the tree
-    // First, try nested: from_path/node_modules/dep_name
-    let nested = format!("{}/node_modules/{}", from_path, dep_name);
-    if packages.contains_key(&nested) {
-        return Some(nested);
-    }
-
-    // Walk up the tree
-    let mut current = from_path.to_string();
-    loop {
-        // Try at current level's node_modules
-        let parent = if current.contains("/node_modules/") {
-            current.rsplit_once("/node_modules/").map(|(p, _)| p.to_string())
-        } else {
-            None
-        };
-
-        if let Some(p) = parent {
-            let candidate = format!("{}/node_modules/{}", p, dep_name);
-            if packages.contains_key(&candidate) {
-                return Some(candidate);
-            }
-            current = p;
-        } else {
-            break;
-        }
-    }
-
-    // Try top-level
-    let top_level = format!("node_modules/{}", dep_name);
-    if packages.contains_key(&top_level) {
-        return Some(top_level);
-    }
-
-    None
-}
-
-fn extract_package_name(path: &str) -> String {
-    let without_prefix = path
-        .strip_prefix("node_modules/")
-        .unwrap_or(path);
-
-    let last_segment = without_prefix
-        .rsplit("/node_modules/")
-        .next()
-        .unwrap_or(without_prefix);
-
-    if last_segment.starts_with('@') {
-        let parts: Vec<&str> = last_segment.splitn(3, '/').collect();
-        if parts.len() >= 2 {
-            return format!("{}/{}", parts[0], parts[1]);
-        }
-    }
-
-    last_segment.split('/').next().unwrap_or(last_segment).to_string()
-}
-
-fn collect_legacy_packages_and_graph(
-    deps: &IndexMap<String, LegacyDependency>,
-    parent_path: &str,
-    packages: &mut Vec<PackageInfo>,
-    seen: &mut HashSet<(String, String)>,
-    dep_graph: &mut DependencyGraph,
-    reverse_graph: &mut ReverseDependencyGraph,
-) {
-    for (name, dep) in deps {
-        let path = if parent_path.is_empty() {
-            format!("node_modules/{}", name)
-        } else {
-            format!("{}/node_modules/{}", parent_path, name)
-        };
-
-        let key = (name.clone(), dep.version.clone());
-        if seen.insert(key) {
-            packages.push(PackageInfo {
-                name: name.clone(),
-                version: dep.version.clone(),
-                path: path.clone(),
-            });
-        }
-
-        // Add edge from parent to this
-        if !parent_path.is_empty() {
-            dep_graph.entry(parent_path.to_string()).or_default().push(path.clone());
-            reverse_graph.entry(path.clone()).or_default().push(parent_path.to_string());
-        }
-
-        if let Some(nested) = &dep.dependencies {
-            collect_legacy_packages_and_graph(nested, &path, packages, seen, dep_graph, reverse_graph);
-        }
-    }
-}
-
-fn build_bulk_request(packages: &[PackageInfo]) -> BulkAuditRequest {
-    let mut request: BulkAuditRequest = HashMap::new();
-
-    for pkg in packages {
-        request
-            .entry(pkg.name.clone())
-            .or_default()
-            .push(pkg.version.clone());
-    }
-
-    for versions in request.values_mut() {
-        versions.sort();
-        versions.dedup();
-    }
-
-    request
-}
-
-async fn query_npm_bulk_api(request: &BulkAuditRequest) -> Result<HashMap<String, Vec<BulkAdvisory>>> {
-    let client = reqwest::Client::builder()
-        .user_agent("na/0.1.0")
-        .gzip(true)
-        .build()?;
-
-    let response: reqwest::Response = client
-        .post("https://registry.npmjs.org/-/npm/v1/security/advisories/bulk")
-        .header("Content-Type", "application/json")
-        .json(request)
-        .send()
-        .await
-        .context("Failed to call npm bulk advisory API")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body: String = response.text().await.unwrap_or_default();
-        anyhow::bail!("npm bulk API returned {}: {}", status, body);
-    }
-
-    let advisories: HashMap<String, Vec<BulkAdvisory>> = response
-        .json()
-        .await
-        .context("Failed to parse bulk advisory response")?;
-
-    Ok(advisories)
-}
-
-fn match_advisories_to_packages<F>(
-    packages: &[PackageInfo],
-    advisories: &HashMap<String, Vec<BulkAdvisory>>,
-    stream: bool,
-    severity_filter: F,
-) -> Vec<VulnerabilityReport>
-where
-    F: Fn(&VulnerabilityReport) -> bool,
-{
-    let mut reports = Vec::new();
-
-    for (pkg_name, pkg_advisories) in advisories {
-        for advisory in pkg_advisories {
-            let vulnerable_range = advisory.vulnerable_versions.as_deref().unwrap_or("*");
-
-            // Filter out workspace root packages (paths without node_modules)
-            for pkg in packages.iter().filter(|p| &p.name == pkg_name && p.path.contains("node_modules")) {
-                if version_matches_range(&pkg.version, vulnerable_range) {
-                    let report = VulnerabilityReport {
-                        package: pkg.name.clone(),
-                        version: pkg.version.clone(),
-                        id: advisory.id,
-                        title: advisory.title.clone(),
-                        severity: advisory.severity.clone(),
-                        cvss_score: advisory.cvss.as_ref().and_then(|c| c.score),
-                        vulnerable_versions: advisory.vulnerable_versions.clone(),
-                        recommendation: advisory.recommendation.clone(),
-                        url: advisory.url.clone(),
-                        cwe: advisory.cwe.clone(),
-                        github_advisory_id: advisory.github_advisory_id.clone(),
-                        via: None,
-                        dependency_chain: vec![],
-                    };
-
-                    if stream && severity_filter(&report) {
-                        print_report(&report);
-                    }
-                    reports.push(report);
-                }
-            }
-        }
-    }
-
-    reports
-}
-
-/// NPM-style meta-vulnerability detection using declared dependencies
-/// Only finds packages that DIRECTLY depend on a directly vulnerable package (1 level)
-fn find_meta_vulnerabilities_npm_style<F>(
-    lockfile: &PackageLock,
-    direct_vulns: &[VulnerabilityReport],
-    stream: bool,
-    severity_filter: F,
-) -> Vec<VulnerabilityReport>
-where
-    F: Fn(&VulnerabilityReport) -> bool,
-{
-    let mut all_vulns = direct_vulns.to_vec();
-
-    // Build set of directly vulnerable package names (not transitive)
-    let direct_vuln_names: HashSet<String> = direct_vulns.iter()
-        .map(|v| v.package.clone())
-        .collect();
-
-    // Track seen package names for deduplication
-    let mut seen_names: HashSet<String> = direct_vuln_names.clone();
-
-    // Single pass: find packages that depend on directly vulnerable packages
-    if let Some(pkgs) = &lockfile.packages {
-        for (path, entry) in pkgs {
-            // Skip root package
-            if path.is_empty() {
-                continue;
-            }
-
-            let pkg_name = extract_package_name(path);
-
-            // Skip if already seen (e.g., directly vulnerable)
-            if seen_names.contains(&pkg_name) {
-                continue;
-            }
-
-            // Check if any declared dependency is DIRECTLY vulnerable
-            let all_deps = collect_all_dep_names(entry);
-            let vulnerable_dep = all_deps.iter().find(|dep| direct_vuln_names.contains(*dep));
-
-            if let Some(via_dep) = vulnerable_dep {
-                seen_names.insert(pkg_name.clone());
-
-                // Get info from the direct vulnerability this depends on
-                let (severity, id, title, url, cwe, cvss) = direct_vulns.iter()
-                    .find(|v| &v.package == via_dep)
-                    .map(|v| (v.severity.clone(), v.id, v.title.clone(), v.url.clone(), v.cwe.clone(), v.cvss_score))
-                    .unwrap_or_else(|| ("unknown".to_string(), 0, "Unknown".to_string(), None, vec![], None));
-
-                let report = VulnerabilityReport {
-                    package: pkg_name.clone(),
-                    version: entry.version.clone().unwrap_or_default(),
-                    id,
-                    title,
-                    severity,
-                    cvss_score: cvss,
-                    vulnerable_versions: None,
-                    recommendation: None,
-                    url,
-                    cwe,
-                    github_advisory_id: None,
-                    via: Some(via_dep.clone()),
-                    dependency_chain: vec![],
-                };
-
-                if stream && severity_filter(&report) {
-                    print_report(&report);
-                }
-                all_vulns.push(report);
-            }
-        }
-    }
-
-    // Sort by severity (critical first), then by whether it's direct or meta
-    // Note: when streaming, output order is discovery order; this sorts for the final collection
-    let severity_order = ["critical", "high", "moderate", "low", "info"];
-    all_vulns.sort_by(|a, b| {
-        let a_idx = severity_order.iter().position(|&x| x == a.severity.to_lowercase()).unwrap_or(5);
-        let b_idx = severity_order.iter().position(|&x| x == b.severity.to_lowercase()).unwrap_or(5);
-        match a_idx.cmp(&b_idx) {
-            std::cmp::Ordering::Equal => {
-                a.via.is_some().cmp(&b.via.is_some())
-            }
-            other => other,
-        }
-    });
-
-    all_vulns
-}
-
-/// Collect production dependency names from a package entry (exclude devDependencies)
-fn collect_all_dep_names(entry: &PackageEntry) -> Vec<String> {
-    let mut deps = Vec::new();
-    if let Some(d) = &entry.dependencies {
-        deps.extend(d.keys().cloned());
-    }
-    // Include peer dependencies as they affect runtime
-    if let Some(d) = &entry.peer_dependencies {
-        deps.extend(d.keys().cloned());
-    }
-    // Skip optional and dev dependencies for npm-style counting
-    deps
-}
-
-#[allow(dead_code)]
-fn find_meta_vulnerabilities(
-    packages: &[PackageInfo],
-    direct_vulns: &[VulnerabilityReport],
-    reverse_graph: &ReverseDependencyGraph,
-) -> Vec<VulnerabilityReport> {
-    let mut all_vulns = direct_vulns.to_vec();
-
-    // Build a map of package name -> paths for quick lookup
-    let mut name_to_paths: HashMap<String, Vec<String>> = HashMap::new();
-    for pkg in packages {
-        name_to_paths.entry(pkg.name.clone()).or_default().push(pkg.path.clone());
-    }
-
-    // Build path -> PackageInfo map, excluding workspace root packages (no node_modules in path)
-    let path_to_pkg: HashMap<String, &PackageInfo> = packages
+/// buildOmitList() from npm's config definitions.
+fn build_omit(args: &Args) -> HashSet<String> {
+    let include: HashSet<&str> = args.include.iter().map(|s| s.as_str()).collect();
+    let mut omit: HashSet<String> = args
+        .omit
         .iter()
-        .filter(|p| p.path.contains("node_modules"))
-        .map(|p| (p.path.clone(), p))
+        .filter(|t| !include.contains(t.as_str()))
+        .cloned()
         .collect();
-
-    // Track vulnerable package names (for npm-style propagation)
-    let mut vulnerable_pkg_names: HashSet<String> = HashSet::new();
-    for v in direct_vulns {
-        vulnerable_pkg_names.insert(v.package.clone());
+    let only_prod = args
+        .only
+        .as_deref()
+        .map(|o| o == "prod" || o == "production")
+        .unwrap_or(false);
+    if only_prod || args.production {
+        omit.insert("dev".to_string());
     }
-
-    // Track all vulnerable paths (direct vulnerabilities)
-    let mut vulnerable_paths: HashSet<String> = HashSet::new();
-    for v in direct_vulns {
-        for (path, pkg) in &path_to_pkg {
-            if pkg.name == v.package && pkg.version == v.version {
-                vulnerable_paths.insert(path.clone());
-            }
-        }
+    if include.contains("dev") {
+        omit.remove("dev");
     }
-
-    // NPM-style: find packages that directly depend on vulnerable packages
-    // Only 1 level of indirection from direct vulnerabilities
-    let mut seen_meta: HashSet<String> = vulnerable_pkg_names.clone();
-
-    for vuln_path in &vulnerable_paths.clone() {
-        if let Some(dependents) = reverse_graph.get(vuln_path) {
-            for dep_path in dependents {
-                if dep_path.is_empty() {
-                    continue;
-                }
-
-                if let Some(pkg) = path_to_pkg.get(dep_path) {
-                    // Only add if we haven't seen this package name
-                    if seen_meta.insert(pkg.name.clone()) {
-                        // Find the vulnerable package this depends on
-                        let via_pkg = path_to_pkg.get(vuln_path).map(|p| p.name.clone());
-
-                        // Get severity from the via package
-                        let (severity, id, title, url, cwe, cvss) = if let Some(via_name) = &via_pkg {
-                            all_vulns.iter()
-                                .find(|v| &v.package == via_name)
-                                .map(|v| (v.severity.clone(), v.id, v.title.clone(), v.url.clone(), v.cwe.clone(), v.cvss_score))
-                                .unwrap_or_else(|| ("unknown".to_string(), 0, "Unknown".to_string(), None, vec![], None))
-                        } else {
-                            ("unknown".to_string(), 0, "Unknown".to_string(), None, vec![], None)
-                        };
-
-                        all_vulns.push(VulnerabilityReport {
-                            package: pkg.name.clone(),
-                            version: pkg.version.clone(),
-                            id,
-                            title,
-                            severity,
-                            cvss_score: cvss,
-                            vulnerable_versions: None,
-                            recommendation: None,
-                            url,
-                            cwe,
-                            github_advisory_id: None,
-                            via: via_pkg,
-                            dependency_chain: vec![],
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort by severity (critical first), then by whether it's direct or meta
-    let severity_order = ["critical", "high", "moderate", "low", "info"];
-    all_vulns.sort_by(|a, b| {
-        let a_idx = severity_order.iter().position(|&x| x == a.severity.to_lowercase()).unwrap_or(5);
-        let b_idx = severity_order.iter().position(|&x| x == b.severity.to_lowercase()).unwrap_or(5);
-        match a_idx.cmp(&b_idx) {
-            std::cmp::Ordering::Equal => {
-                // Direct vulns first
-                a.via.is_some().cmp(&b.via.is_some())
-            }
-            other => other,
-        }
-    });
-
-    all_vulns
+    omit
 }
 
-fn version_matches_range(version: &str, range: &str) -> bool {
-    if range == "*" || range.is_empty() {
-        return true;
+fn cache_dir(args: &Args) -> PathBuf {
+    if let Some(d) = &args.cache_dir {
+        return d.clone();
     }
-
-    if range == version {
-        return true;
+    if let Some(d) = std::env::var_os("NA_CACHE_DIR") {
+        return PathBuf::from(d);
     }
-
-    let v_parts: Vec<u64> = version
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    if v_parts.is_empty() {
-        return false;
+    if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(x).join("na");
     }
-
-    // Handle || (OR) ranges
-    if range.contains("||") {
-        for or_part in range.split("||") {
-            if check_range_part(&v_parts, or_part.trim()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    check_range_part(&v_parts, range)
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    home.join(".cache").join("na")
 }
 
-fn check_range_part(v_parts: &[u64], range: &str) -> bool {
-    // Handle space-separated (AND) conditions
-    for condition in range.split_whitespace() {
-        if !check_condition(v_parts, condition) {
-            return false;
-        }
+async fn detect_node_version() -> Option<String> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("node").arg("--version").output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    true
-}
-
-fn check_condition(v_parts: &[u64], condition: &str) -> bool {
-    let (op, ver_str) = if condition.starts_with(">=") {
-        (">=", &condition[2..])
-    } else if condition.starts_with("<=") {
-        ("<=", &condition[2..])
-    } else if condition.starts_with('>') {
-        (">", &condition[1..])
-    } else if condition.starts_with('<') {
-        ("<", &condition[1..])
-    } else if condition.starts_with('=') {
-        ("=", &condition[1..])
-    } else if condition.starts_with('^') || condition.starts_with('~') {
-        return true; // Be conservative
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
     } else {
-        ("=", condition)
+        Some(s)
+    }
+}
+
+async fn detect_npm_version() -> Option<String> {
+    // Resolve the `npm` on PATH to its package.json without spawning it.
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("npm");
+            if let Ok(real) = std::fs::canonicalize(&candidate) {
+                let mut p = real.parent();
+                while let Some(dir) = p {
+                    let pj = dir.join("package.json");
+                    if let Ok(text) = std::fs::read_to_string(&pj) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if v.get("name").and_then(|n| n.as_str()) == Some("npm") {
+                                return v.get("version").and_then(|n| n.as_str()).map(|s| s.to_string());
+                            }
+                        }
+                    }
+                    p = dir.parent();
+                }
+            }
+        }
+    }
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("npm").arg("--version").output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() && !s.is_empty() {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+async fn async_main(args: Args) -> i32 {
+    let t0 = Instant::now();
+    if let Some(sub) = args.subcommand.first() {
+        eprintln!("na: `npm audit {sub}` is not supported; na only produces the audit report.");
+        return 1;
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let prefix = match &args.prefix {
+        Some(p) if p.is_absolute() => p.clone(),
+        Some(p) => cwd.join(p),
+        None => tree::find_prefix(&cwd),
+    };
+    let cfg = config::NpmConfig::load(&prefix);
+
+    // engine checks need the local node/npm versions; find them in the
+    // background while everything else happens.
+    let node_fut = match args.node_version.clone() {
+        Some(v) => tokio::spawn(async move { Some(v) }),
+        None => tokio::spawn(detect_node_version()),
+    };
+    let npm_fut = match args.npm_version.clone() {
+        Some(v) => tokio::spawn(async move { Some(v) }),
+        None => tokio::spawn(detect_npm_version()),
     };
 
-    let c_parts: Vec<u64> = ver_str
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    if c_parts.is_empty() {
-        return true;
-    }
-
-    let cmp = compare_versions(v_parts, &c_parts);
-
-    match op {
-        ">=" => cmp >= 0,
-        "<=" => cmp <= 0,
-        ">" => cmp > 0,
-        "<" => cmp < 0,
-        "=" => cmp == 0,
-        _ => true,
-    }
-}
-
-fn compare_versions(a: &[u64], b: &[u64]) -> i32 {
-    let max_len = a.len().max(b.len());
-    for i in 0..max_len {
-        let av = a.get(i).copied().unwrap_or(0);
-        let bv = b.get(i).copied().unwrap_or(0);
-        if av < bv {
-            return -1;
-        }
-        if av > bv {
+    let t_tree = Instant::now();
+    let tree = match tree::Tree::load(&prefix) {
+        Ok(t) => t,
+        Err(e) if e.to_string() == "ENOLOCK" => {
+            eprintln!("npm error code ENOLOCK");
+            eprintln!("npm error audit This command requires an existing lockfile.");
+            eprintln!("npm error audit Try creating one first with: npm i --package-lock-only");
+            eprintln!("npm error audit Original error: loadVirtual requires existing shrinkwrap file");
             return 1;
         }
-    }
-    0
-}
-
-/// Compute vulnerability statistics for summary display
-fn compute_vuln_stats(reports: &[VulnerabilityReport]) -> (usize, usize, usize, HashMap<&'static str, usize>) {
-    let severity_order = ["info", "low", "moderate", "high", "critical"];
-    let mut package_info: HashMap<&str, (usize, bool)> = HashMap::new();
-
-    for r in reports {
-        let sev_idx = severity_order.iter().position(|&s| s == r.severity.to_lowercase()).unwrap_or(0);
-        let is_direct = r.via.is_none();
-
-        package_info
-            .entry(&r.package)
-            .and_modify(|(max_sev, has_direct)| {
-                if sev_idx > *max_sev {
-                    *max_sev = sev_idx;
-                }
-                if is_direct {
-                    *has_direct = true;
-                }
-            })
-            .or_insert((sev_idx, is_direct));
-    }
-
-    let total_packages = package_info.len();
-    let direct_pkg_count = package_info.values().filter(|(_, is_direct)| *is_direct).count();
-    let transitive_pkg_count = total_packages - direct_pkg_count;
-
-    let mut severity_counts: HashMap<&'static str, usize> = HashMap::new();
-    for (_, (sev_idx, _)) in &package_info {
-        let sev = severity_order[*sev_idx];
-        *severity_counts.entry(sev).or_insert(0) += 1;
-    }
-
-    (total_packages, direct_pkg_count, transitive_pkg_count, severity_counts)
-}
-
-/// Display summary only (for streaming mode where vulns were already printed)
-fn display_summary(reports: &[VulnerabilityReport]) -> Result<()> {
-    if reports.is_empty() {
-        println!("{}", "found 0 vulnerabilities".green().bold());
-        return Ok(());
-    }
-
-    let (total, direct, transitive, severity_counts) = compute_vuln_stats(reports);
-
-    // Summary line
-    let mut summary_parts = Vec::new();
-    for sev in ["critical", "high", "moderate", "low", "info"] {
-        if let Some(&count) = severity_counts.get(sev) {
-            summary_parts.push(format!("{} {}", count, sev));
+        Err(e) => {
+            eprintln!("npm error {e}");
+            return 1;
         }
-    }
+    };
+    let tree_ms = t_tree.elapsed().as_millis();
 
-    println!(
-        "\nfound {} {} ({} direct, {} transitive): {}",
-        total.to_string().bold(),
-        if total == 1 { "vulnerability" } else { "vulnerabilities" },
-        direct,
-        transitive,
-        summary_parts.join(", ")
-    );
-
-    Ok(())
-}
-
-fn display_results(reports: &[VulnerabilityReport]) -> Result<()> {
-    if reports.is_empty() {
-        println!("{}", "found 0 vulnerabilities".green().bold());
-        return Ok(());
-    }
-
-    let (total, direct, transitive, severity_counts) = compute_vuln_stats(reports);
-
-    println!(
-        "found {} {} ({} direct, {} transitive):\n",
-        total.to_string().bold(),
-        if total == 1 { "vulnerability" } else { "vulnerabilities" },
-        direct,
-        transitive
-    );
-
-    for report in reports {
-        print_report(report);
-    }
-
-    // Summary line
-    let mut summary_parts = Vec::new();
-    for sev in ["critical", "high", "moderate", "low", "info"] {
-        if let Some(&count) = severity_counts.get(sev) {
-            summary_parts.push(format!("{} {}", count, sev));
+    let registry_url = args
+        .registry
+        .clone()
+        .unwrap_or_else(|| cfg.registry.clone())
+        .trim_end_matches('/')
+        .to_string();
+    let registry = match registry::Registry::new(registry::RegistryConfig {
+        registry: registry_url,
+        scopes: cfg.scopes.clone(),
+        tokens: cfg.tokens.clone(),
+        audit_registry: cfg.audit_registry.clone(),
+        concurrency: args.concurrency,
+        user_agent: format!("na/{}", env!("CARGO_PKG_VERSION")),
+        cache_dir: if args.no_cache { None } else { Some(cache_dir(&args)) },
+        prefer_online: args.prefer_online,
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("npm error {e}");
+            return 1;
         }
-    }
-
-    println!(
-        "\n{} ({} in total)",
-        summary_parts.join(", "),
-        total
-    );
-
-    Ok(())
-}
-
-fn print_report(report: &VulnerabilityReport) {
-    let severity_colored = match report.severity.to_lowercase().as_str() {
-        "critical" => report.severity.to_lowercase().red().bold(),
-        "high" => report.severity.to_lowercase().red(),
-        "moderate" => report.severity.to_lowercase().yellow(),
-        "low" => report.severity.to_lowercase().cyan(),
-        _ => report.severity.to_lowercase().white(),
     };
 
-    println!("{}", report.title.bold());
-    println!("  Severity: {}", severity_colored);
-    println!("  Package: {}", report.package);
-    println!("  Installed: {}", report.version);
+    let color = if args.no_color {
+        false
+    } else if let Some(c) = args.color.as_deref().or(cfg.color.as_deref()) {
+        match c {
+            "always" | "true" | "1" => true,
+            "false" | "0" | "never" | "" => false,
+            _ => std::io::stdout().is_terminal(),
+        }
+    } else if std::env::var("NO_COLOR").map(|v| v != "0").unwrap_or(false) {
+        false
+    } else {
+        std::io::stdout().is_terminal()
+    };
 
-    if let Some(via) = &report.via {
-        println!("  Via: {}", via.yellow());
-        if !report.dependency_chain.is_empty() {
-            println!("  Chain: {}", report.dependency_chain.join(" > "));
+    let opts = audit::AuditOpts {
+        omit: build_omit(&args),
+        default_tag: cfg.tag.clone(),
+        node_version: None,
+        npm_version: None,
+    };
+    let env = async move {
+        (
+            node_fut.await.ok().flatten(),
+            npm_fut.await.ok().flatten(),
+        )
+    };
+
+    let mut stats = audit::RunStats {
+        bulk_ms: 0,
+        packuments_fetched: 0,
+        advisories_computed: 0,
+        blocked_awaits: 0,
+        wait_ms: 0,
+        load_ms: 0,
+    };
+    let t_audit = Instant::now();
+    let mut report = match audit::run(&tree, registry, opts, env, &mut stats).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("npm warn audit {e}");
+            eprintln!("audit endpoint returned an error");
+            return 1;
+        }
+    };
+    let audit_ms = t_audit.elapsed().as_millis();
+
+    if std::env::var_os("NA_DEBUG_ORDER").is_some() {
+        for v in report.vulns.iter().filter(|v| !v.deleted) {
+            let advs: Vec<String> = v
+                .advisories
+                .iter()
+                .map(|a| {
+                    let src = match &a.source {
+                        Some(s) if a.is_advisory() => s.to_string(),
+                        _ => "meta".to_string(),
+                    };
+                    format!("{}:{}:{}", a.dependency, src, a.range())
+                })
+                .collect();
+            eprintln!("{}\t{}", v.name, advs.join(" | "));
         }
     }
 
-    if let Some(vuln_versions) = &report.vulnerable_versions {
-        println!("  Vulnerable: {}", vuln_versions);
+    let data = report.to_json(&tree);
+    let level = args
+        .audit_level
+        .clone()
+        .or_else(|| cfg.audit_level.clone())
+        .unwrap_or_else(|| "low".to_string());
+    let code = report::exit_code(&data, &level);
+
+    let out = if args.json {
+        report::json(&data)
+    } else {
+        report::detail(&data, &report::Colors { enabled: color })
+    };
+    {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        let _ = writeln!(lock, "{out}");
+        let _ = lock.flush();
     }
 
-    if let Some(rec) = &report.recommendation {
-        println!("  Recommendation: {}", rec.green());
+    if args.timing {
+        eprintln!("na timing:");
+        eprintln!("  load tree:        {tree_ms:>6} ms ({} nodes)", tree.nodes.len());
+        eprintln!("  bulk advisories:  {:>6} ms", stats.bulk_ms);
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "  packuments:       {:>6} fetched, {} fresh in cache, {} revalidated, {} failed, {:.1} MB, {} ms summed network, {} ms summed parse",
+            stats.packuments_fetched,
+            registry::stats::CACHE_FRESH.load(Relaxed),
+            registry::stats::CACHE_REVALIDATED.load(Relaxed),
+            registry::stats::FAILED.load(Relaxed),
+            registry::stats::BYTES.load(Relaxed) as f64 / 1e6,
+            registry::stats::NET_NS.load(Relaxed) / 1_000_000,
+            registry::stats::PARSE_NS.load(Relaxed) / 1_000_000,
+        );
+        eprintln!(
+            "  metavuln calc:    {:>6} ms over {} advisories; {} waits on downloads ({} ms summed)",
+            stats.load_ms, stats.advisories_computed, stats.blocked_awaits, stats.wait_ms
+        );
+        eprintln!("  audit total:      {audit_ms:>6} ms");
+        eprintln!("  total:            {:>6} ms", t0.elapsed().as_millis());
     }
-
-    if let Some(url) = &report.url {
-        println!("  More info: {}", url.dimmed());
-    }
-
-    println!();
+    code
 }

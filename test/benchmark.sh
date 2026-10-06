@@ -63,8 +63,12 @@ npm_avg=$((npm_total / RUNS))
 speedup=$(python3 -c "print(round($npm_avg / $na_avg, 1))")
 
 # Get vulnerability counts
-na_count=$("$NA_BIN" 2>&1 | head -1 | grep -oE '[0-9]+' | head -1 || echo "0")
-npm_count=$(npm audit 2>&1 | grep -oE '[0-9]+ vulnerabilities' | grep -oE '[0-9]+' | head -1 || echo "0")
+# both tools print the same summary line, e.g. "527 vulnerabilities (34 low, ...)" or "1 high severity vulnerability"
+count_vulns() { sed -nE 's/^([0-9]+) (vulnerabilit(y|ies)|[a-z]+ severity vulnerabilit(y|ies)).*/\1/p' | head -1; }
+na_count=$("$NA_BIN" 2>&1 | count_vulns)
+npm_count=$(npm audit 2>&1 | count_vulns)
+na_count=${na_count:-0}
+npm_count=${npm_count:-0}
 
 echo ""
 echo "============================================"

@@ -23,26 +23,39 @@ that it finishes in well under a second once its cache is warm.
 | na (cold cache) | 1687ms | 527 |
 | npm audit (cold cache) | 23.4s | 527 |
 
-*Measured on macOS (Apple Silicon) against the fixture in `test/` (6,121 packages). Your mileage will vary with network bandwidth: a cold run downloads ~70 MB of compressed registry metadata, the same metadata npm downloads.*
+*Measured on macOS (Apple Silicon) against the fixture in `test/` (6,121 packages). Your mileage will vary with network bandwidth: a cold run downloads about 240 MB of registry metadata (roughly 70 MB compressed on the wire), the same metadata npm downloads.*
 <!-- BENCHMARK_END -->
 
 ## Install
 
+`na` is a single static binary. You need a Rust toolchain (1.80 or newer,
+via [rustup](https://rustup.rs)); Node.js is *not* required to run it.
+
+```bash
+cargo install --git https://github.com/dawsbot/na
+```
+
+This builds `na` and puts it in `~/.cargo/bin`, which rustup adds to your
+`PATH`. Or build from a clone:
+
 ```bash
 git clone https://github.com/dawsbot/na
 cd na
-cargo build --release
-cp target/release/na /usr/local/bin/
+cargo install --path .            # same result as above
+# or, without installing:
+cargo build --release && ./target/release/na --help
 ```
+
+There are no prebuilt binaries or package-manager packages yet.
 
 ## Usage
 
 ```bash
 # in a project with a package-lock.json (or npm-shrinkwrap.json)
-na                      # same report as `npm audit`, exit 1 if anything is found
+na                      # same report and exit code as `npm audit`
 na --json               # same document as `npm audit --json`
 na --omit=dev           # same as `npm audit --omit=dev` (also --production, --only=prod, --include)
-na --audit-level=high   # exit code rule, same as npm
+na --audit-level=high   # same exit-code rule as npm (default level: low)
 ```
 
 Flags npm does not have:
@@ -50,14 +63,18 @@ Flags npm does not have:
 | Flag | Meaning |
 |------|---------|
 | `--cache-dir DIR` / `--no-cache` / `--prefer-online` | Where registry metadata is cached (default `~/.cache/na`), or skip the cache, or always revalidate it |
-| `--prefix DIR` | Project directory (default: nearest ancestor with a `package.json`) |
+| `--prefix DIR` | Project directory (default: the nearest ancestor of the current directory containing a `package.json` or `node_modules`) |
 | `--registry URL` | Override the registry (also read from `.npmrc` and `npm_config_registry`) |
-| `--node-version` / `--npm-version` | Versions used for `engines` checks (default: the installed `node` and `npm`) |
+| `--node-version` / `--npm-version` | Versions used for `engines` checks when picking a `--force` fix (default: the `node` and `npm` on your `PATH`; if neither is installed, engine checks pass) |
 | `--timing` | Phase timings on stderr |
+| `--color[=always|false]` / `--no-color` | Force colour on or off (default: on when stdout is a terminal, like npm) |
 | `--concurrency N` | Maximum concurrent registry requests (default 64) |
 
 `npm audit fix` and `npm audit signatures` are not supported; `na` only
-produces the report.
+produces the report. Configuration is read from `.npmrc` (project, then
+`~/.npmrc`) and `npm_config_*` environment variables for `registry`,
+`@scope:registry`, `//host/:_authToken`, `audit-level`, `color` and `tag`;
+other npm settings are ignored.
 
 ## How it matches npm
 
@@ -99,9 +116,10 @@ range propagates to that package's dependents. So two `npm audit` runs on the
 same lockfile can print different ranges for a handful of deeply nested
 packages (on the fixture in `test/`, npm's own cold and warm runs disagree on
 one line). `na` always processes dependencies in lockfile order, which makes
-its output stable from run to run and matches npm's usual warm-cache result;
-in the fixture, 2 of 3,466 output lines differ from npm for this reason, and
-`--json` differs only in those two `range` values.
+its output stable from run to run. On the fixture this leaves one or two of
+the 3,466 report lines (the `range` of `jest-resolve-dependencies`, and
+sometimes `jest`) different from a given npm run; `--json` differs only in
+those `range` values.
 
 Other things `na` does not reproduce: `--before` / `min-release-age` windows,
 `npm audit fix`, `audit signatures`, and `.npmrc` settings other than
@@ -111,22 +129,25 @@ and `tag`.
 ## Why is it faster?
 
 - **No Node.js startup**, and no npm CLI bootstrapping.
-- **Registry metadata is fetched concurrently over HTTP/2** and parsed on all
-  cores while the dependency walk proceeds; npm fetches a handful at a time.
+- **Registry metadata is fetched concurrently over HTTP/2** (64 requests in
+  flight by default) and parsed on all cores while the dependency walk
+  proceeds.
 - **Dependents are prefetched one level ahead**: as soon as a package is known
   to be vulnerable, the metadata of everything that depends on it starts
   downloading before the algorithm gets there.
 - **A validated on-disk cache** (`~/.cache/na`) keeps packuments for the
   registry's `max-age` (5 minutes) and revalidates them with `If-None-Match`
-  afterwards, so repeat runs download almost nothing. npm has the same cache
-  policy; it is just slower about everything around it.
+  afterwards, so repeat runs download almost nothing. This is the same policy
+  npm's own cache follows.
 
 ## Status
 
-Output is verified byte-for-byte against npm 11.19.1 on the fixture in `test/`
-and on small projects covering direct, dev-only, aliased (`npm:`), prerelease
-and workspace dependencies. Report issues at
-[GitHub](https://github.com/dawsbot/na/issues).
+Output is verified byte-for-byte against npm 11.19.1 (text, `--json`, exit
+codes, and terminal colour codes) on the fixture in `test/` and on small
+projects covering empty, direct, dev-only (`--omit=dev`), aliased (`npm:`),
+prerelease and workspace dependencies. Lockfile versions 2 and 3 are tested;
+version 1 lockfiles are converted the way arborist converts them but have had
+less testing. Report issues at [GitHub](https://github.com/dawsbot/na/issues).
 
 ## License
 

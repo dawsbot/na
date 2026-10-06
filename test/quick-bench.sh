@@ -61,7 +61,7 @@ echo ""
 
 if [[ -f "$README_PATH" ]]; then
     echo "Updating README.md..."
-    perl -i -0777 -pe "s/<!-- BENCHMARK_START -->.*?<!-- BENCHMARK_END -->/<!-- BENCHMARK_START -->\n| Tool | Time | Vulnerabilities reported |\n|------|------|--------------------------|\n| na (warm cache) | ${NA_WARM_MS}ms | ${NA_TOTAL:-0} |\n| na (cold cache) | ${NA_COLD_MS}ms | ${NA_TOTAL:-0} |\n| npm audit (cold cache) | ${NPM_SEC}s | ${NPM_TOTAL:-0} |\n\n*Measured on macOS (Apple Silicon) against the fixture in \`test\/\` (6,121 packages). Your mileage will vary with network bandwidth: a cold run downloads ~70 MB of compressed registry metadata, the same metadata npm downloads.*\n<!-- BENCHMARK_END -->/s" "$README_PATH"
+    perl -i -0777 -pe "s/<!-- BENCHMARK_START -->.*?<!-- BENCHMARK_END -->/<!-- BENCHMARK_START -->\n| Tool | Time | Vulnerabilities reported |\n|------|------|--------------------------|\n| na (warm cache) | ${NA_WARM_MS}ms | ${NA_TOTAL:-0} |\n| na (cold cache) | ${NA_COLD_MS}ms | ${NA_TOTAL:-0} |\n| npm audit (cold cache) | ${NPM_SEC}s | ${NPM_TOTAL:-0} |\n\n*Measured on macOS (Apple Silicon) against the fixture in \`test\/\` (6,121 packages). Your mileage will vary with network bandwidth: a cold run downloads about 240 MB of registry metadata (roughly 70 MB compressed on the wire), the same metadata npm downloads.*\n<!-- BENCHMARK_END -->/s" "$README_PATH"
     sed -i '' "s/<!-- FASTEST_SPEEDUP_START -->[^<]*<!-- FASTEST_SPEEDUP_END -->/<!-- FASTEST_SPEEDUP_START -->${SPEEDUP_WARM}<!-- FASTEST_SPEEDUP_END -->/" "$README_PATH"
     echo "README.md updated!"
 fi

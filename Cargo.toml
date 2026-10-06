@@ -3,6 +3,9 @@ name = "na"
 version = "0.2.0"
 edition = "2021"
 description = "npm audit, byte-for-byte, without Node.js"
+license = "MIT"
+repository = "https://github.com/dawsbot/na"
+rust-version = "1.80"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

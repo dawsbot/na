@@ -1,0 +1,84 @@
+name: release
+
+# Builds static binaries for every supported platform and attaches them,
+# with a checksums.txt, to the GitHub release for the pushed tag.
+# install.sh downloads from these assets.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/na" dist/na
+          tar -C dist -czf "na-${{ matrix.target }}.tar.gz" na
+          tar -tzf "na-${{ matrix.target }}.tar.gz"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/na.exe" -DestinationPath "na-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: na-${{ matrix.target }}
+          path: |
+            na-*.tar.gz
+            na-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -eu
+          cd artifacts
+          sha256sum na-* > checksums.txt
+          cat checksums.txt
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            artifacts/na-*
+            artifacts/checksums.txt
+          generate_release_notes: true

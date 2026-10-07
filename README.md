@@ -28,25 +28,25 @@ that it finishes in well under a second once its cache is warm.
 
 ## Install
 
-`na` is a single static binary. You need a Rust toolchain (1.80 or newer,
-via [rustup](https://rustup.rs)); Node.js is *not* required to run it.
+```bash
+curl -fsSL https://raw.githubusercontent.com/dawsbot/na/main/install.sh | sh
+```
+
+This downloads the prebuilt binary for your platform from the
+[latest release](https://github.com/dawsbot/na/releases/latest), checks its
+SHA-256 against the release's `checksums.txt`, and installs it to
+`/usr/local/bin` if that is writable, otherwise `~/.local/bin`. Set
+`NA_INSTALL_DIR` to choose the directory and `NA_VERSION=v0.2.0` to pin a
+release. Prebuilt binaries exist for macOS (Apple Silicon and Intel), Linux
+(x86_64 and arm64, fully static) and Windows x86_64. Node.js is not required.
+
+If there is no binary for your platform, or you would rather build it
+yourself, you need a Rust toolchain (1.80 or newer, via
+[rustup](https://rustup.rs)):
 
 ```bash
 cargo install --git https://github.com/dawsbot/na
 ```
-
-This builds `na` and puts it in `~/.cargo/bin`, which rustup adds to your
-`PATH`. Or build from a clone:
-
-```bash
-git clone https://github.com/dawsbot/na
-cd na
-cargo install --path .            # same result as above
-# or, without installing:
-cargo build --release && ./target/release/na --help
-```
-
-There are no prebuilt binaries or package-manager packages yet.
 
 ## Usage
 
